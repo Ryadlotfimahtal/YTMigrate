@@ -5,10 +5,14 @@ from typing import Tuple
 from datetime import datetime
 
 import ytmusicapi
-from ytmusicapi import YTMusic, setup_oauth
+from ytmusicapi import YTMusic
 
-version = "1.0"
-config_filename = "config.json"
+version = "1.1"
+# Browser headers of each account (OAuth is rejected by YouTube Music since late 2024)
+source_auth_filename = "source_browser.json"
+dest_auth_filename = "dest_browser.json"
+# Number of songs sent per add_playlist_items request
+add_batch_size = 100
 
 
 def prompt_yes_no(message: str, default_yes: bool = True) -> bool:
@@ -37,20 +41,19 @@ def write_backup(data: list | dict, type: str) -> bool:
 
 def copy_likes(ytm: Tuple[YTMusic, YTMusic]):
     print("Loading liked songs from source account...", end="", flush=True)
-    liked_source = ytm[0].get_playlist("LM", limit=5000)
-    liked_source_ids = functools.reduce(
-        lambda l, i: l + [i["videoId"]], liked_source["tracks"], []
-    )
+    liked_source = ytm[0].get_playlist("LM", limit=None)
+    liked_source_ids = track_video_ids(liked_source["tracks"])
 
     print("\rLoading liked songs from destination account...", end="", flush=True)
-    liked_dest = ytm[1].get_playlist("LM", limit=5000)
-    liked_dest_ids = functools.reduce(
-        lambda l, i: l + [i["videoId"]], liked_dest["tracks"], []
-    )
+    liked_dest = ytm[1].get_playlist("LM", limit=None)
+    liked_dest_ids = set(track_video_ids(liked_dest["tracks"]))
 
     print("\r" + " " * 50 + "\r", end="", flush=True)
 
-    songs_to_like = list(set(liked_source_ids) - set(liked_dest_ids))
+    # Liked songs are listed newest first: like the oldest first to keep the order
+    songs_to_like = [
+        song for song in reversed(liked_source_ids) if song not in liked_dest_ids
+    ]
 
     if len(songs_to_like) < len(liked_source_ids):
         print(
@@ -66,50 +69,109 @@ def copy_likes(ytm: Tuple[YTMusic, YTMusic]):
         print("Operation cancelled!")
         return
 
-    try:
-        for index, song in enumerate(songs_to_like):
-            print(
-                f"\rAdding songs to likes... {index + 1}/{len(songs_to_like)}",
-                end="",
-                flush=True,
-            )
+    failed = []
+    for index, song in enumerate(songs_to_like):
+        print(
+            f"\rAdding songs to likes... {index + 1}/{len(songs_to_like)}",
+            end="",
+            flush=True,
+        )
+        try:
             ytm[1].rate_song(song, "LIKE")
-    except Exception as e:
-        print("\nFailed to like songs,", e)
+        except Exception as e:
+            failed.append(song)
+            print(f"\nFailed to like song {song},", e)
+
+    if failed:
+        print(
+            f"\n{len(failed)} out of {len(songs_to_like)} songs could not be liked, "
+            "run 'Copy likes' again to retry them."
+        )
     else:
         print("\nTransferred all liked songs successfully!")
 
 
+def track_video_ids(tracks: list) -> list:
+    # Unavailable (removed / region-blocked) tracks have no videoId
+    return [track["videoId"] for track in tracks if track.get("videoId")]
+
+
+def add_songs(ytm: YTMusic, playlist_id: str, song_ids: list) -> list:
+    """Adds songs in batches, retrying a failed batch one song at a time.
+    Returns the ids of the songs that could not be added."""
+
+    def add(ids: list) -> bool:
+        try:
+            result = ytm.add_playlist_items(playlist_id, ids, duplicates=True)
+        except Exception:
+            return False
+        return isinstance(result, dict) and "SUCCEEDED" in result.get("status", "")
+
+    failed = []
+    for start in range(0, len(song_ids), add_batch_size):
+        batch = song_ids[start : start + add_batch_size]
+        print(
+            f"\rAdding songs... {start + len(batch)}/{len(song_ids)}",
+            end="",
+            flush=True,
+        )
+        if not add(batch):
+            failed += [song for song in batch if not add([song])]
+    print()
+    return failed
+
+
 def copy_playlist(
-    ytm: Tuple[YTMusic, YTMusic], playlist_id: str, playlist_name: str = ""
+    ytm: Tuple[YTMusic, YTMusic],
+    playlist_id: str,
+    playlist_name: str = "",
+    dest_titles: set | None = None,
 ):
-    print(f"Loading playlist: {playlist_name} - [{playlist_id}]...")
-    playlist_data = ytm[0].get_playlist(playlist_id, limit=5000)
+    print(f"\nLoading playlist: {playlist_name} - [{playlist_id}]...")
+    playlist_data = ytm[0].get_playlist(playlist_id, limit=None)
     if not playlist_data:
         print("Failed to load playlist!")
         return
 
-    song_ids = functools.reduce(
-        lambda l, i: l + [i["videoId"]], playlist_data["tracks"], []
-    )
+    song_ids = track_video_ids(playlist_data["tracks"])
+    unavailable = len(playlist_data["tracks"]) - len(song_ids)
+    if unavailable:
+        print(f"Skipping {unavailable} unavailable songs!")
+
+    if dest_titles and playlist_data["title"] in dest_titles:
+        if not prompt_yes_no(
+            "A playlist with this name already exists in the destination account, "
+            "copy it anyway?",
+            default_yes=False,
+        ):
+            print("Playlist skipped!")
+            return
 
     print("Creating playlist... ", end="", flush=True)
     try:
         dest_playlist_id = ytm[1].create_playlist(
             playlist_data["title"],
-            playlist_data["description"] if playlist_data["description"] else "",
-            playlist_data["privacy"],
-            song_ids,
+            playlist_data.get("description") or "",
+            playlist_data.get("privacy") or "PRIVATE",
         )
-        # dest_playlist_id = "TEST_IS_WORKING"
-        if type(dest_playlist_id) == str:
-            print(
-                f"\rPlaylist created successfully! URL: https://music.youtube.com/playlist?list={dest_playlist_id}"
-            )
-        else:
-            print("\nFailed to create new playlist!")
     except Exception as e:
         print("\nFailed to create new playlist,", e)
+        return
+    if type(dest_playlist_id) != str:
+        print("\nFailed to create new playlist!")
+        return
+    print(
+        f"\rPlaylist created! URL: https://music.youtube.com/playlist?list={dest_playlist_id}"
+    )
+
+    failed = add_songs(ytm[1], dest_playlist_id, song_ids)
+    if failed:
+        print(
+            f"Copied {len(song_ids) - len(failed)} out of {len(song_ids)} songs, "
+            f"failed: {' '.join(failed)}"
+        )
+    else:
+        print(f"Copied all {len(song_ids)} songs successfully!")
 
 
 def parse_number_ids(selection: str):
@@ -133,7 +195,9 @@ def parse_number_ids(selection: str):
 
 def menu_copy_playlists(ytm: Tuple[YTMusic, YTMusic]):
     print("Loading playlists from source account...", end="", flush=True)
-    source_playlists = ytm[0].get_library_playlists(100)
+    source_playlists = ytm[0].get_library_playlists(limit=None)
+    print("\rLoading playlists from destination account...", end="", flush=True)
+    dest_titles = {p["title"] for p in ytm[1].get_library_playlists(limit=None)}
     print("\rSelect playlists:" + " " * 30)
 
     all_playlists = []
@@ -174,7 +238,7 @@ def menu_copy_playlists(ytm: Tuple[YTMusic, YTMusic]):
 
         for p in sel_playlists:
             try:
-                copy_playlist(ytm, p["playlistId"], p["title"])
+                copy_playlist(ytm, p["playlistId"], p["title"], dest_titles)
             except Exception as e:
                 print(f"Error copying playlist '{p['title']}': {e}")
                 # Handle the error appropriately, e.g., log it or prompt the user
@@ -363,64 +427,72 @@ def menu_main(ytm: Tuple[YTMusic, YTMusic]):
                 print("Invalid option:", sel)
 
 
-def check_config() -> bool:
-    if not os.path.isfile(config_filename):
-        print("Configuration file not found!")
+def setup_account(label: str, filename: str) -> bool:
+    print(f"\nLog in to the {label} account:")
+    print(
+        "  1. Open https://music.youtube.com in your browser, signed in with the "
+        f"{label} account (switch account from the avatar menu if needed)\n"
+        "  2. Open the developer tools > Network tab, filter on 'browse' "
+        "and click on Library\n"
+        "  3. Copy the request headers of a POST 'browse?...' request with status 200 "
+        "(Firefox: right click > Copy Value > Copy Request Headers)\n"
+        "  4. Paste them below, then press Enter and Ctrl-D"
+    )
+    try:
+        ytmusicapi.setup(filepath=filename)
+    except Exception as e:
+        print("Failed to read headers:", e)
         return False
     return True
+
+
+def load_account(label: str, filename: str) -> Tuple[YTMusic, str] | None:
+    if not os.path.isfile(filename) and not setup_account(label, filename):
+        return None
+    try:
+        with open(filename, "r") as auth_file:
+            headers = {k.lower(): v for k, v in json.load(auth_file).items()}
+        if "SAPISIDHASH" not in headers.get("authorization", ""):
+            raise ValueError(
+                "no 'authorization: SAPISIDHASH ...' header, copy the headers "
+                "of a POST 'browse' request"
+            )
+        ytm = YTMusic(filename)
+        info = ytm.get_account_info()
+    except Exception as e:
+        print(f"Authentication failed for the {label} account:", e)
+        print(f"Delete {filename} and run the script again to log in again.")
+        return None
+    account = f"{info['accountName']} {info.get('channelHandle') or ''}".strip()
+    print(f"{label.capitalize()} account: {account}")
+    return ytm, account
 
 
 def do_auth() -> Tuple[YTMusic, YTMusic] | None:
-    with open(config_filename, "r") as config_file:
-        try:
-            config = json.load(config_file)
-            ytm = None
-            try:
-                ytm = (
-                    YTMusic(json.dumps(config["source_account"]["oauth_headers"])),
-                    YTMusic(json.dumps(config["dest_account"]["oauth_headers"])),
-                )
-            except Exception as e:
-                print("Authentication failed:", e)
-            else:
-                print("Authentication successful!")
-            return ytm
-        except Exception as e:
-            print("Failed to load configuration:", str(e))
-            return None
+    source = load_account("source", source_auth_filename)
+    if not source:
+        return None
+    dest = load_account("destination", dest_auth_filename)
+    if not dest:
+        return None
 
-
-def setup_auth() -> bool:
-    print("Set up accounts:")
-    config = {
-        "source_account": {"oauth_headers": {}},
-        "dest_account": {"oauth_headers": {}},
-    }
-
-    print("Log in with Oauth for source account:")
-    config["source_account"]["oauth_headers"] = ytmusicapi.setup_oauth()
-
-    print("Log in with Oauth for destination account:")
-    config["dest_account"]["oauth_headers"] = ytmusicapi.setup_oauth()
-
-    print("Writing configuration file...")
-    try:
-        with open(config_filename, "w") as json_file:
-            json.dump(config, json_file, indent=2)
-    except Exception as e:
-        print("Failed to create config:", str(e))
-        return False
-    else:
-        print("Configuration created!")
-    return True
+    if source[1] == dest[1]:
+        print(
+            "Source and destination are the same account! Delete "
+            f"{dest_auth_filename} and log in again with the destination account."
+        )
+        return None
+    if not prompt_yes_no(f"Copy from '{source[1]}' to '{dest[1]}'?"):
+        print("Delete the JSON file of the wrong account and run the script again.")
+        return None
+    return source[0], dest[0]
 
 
 def main():
     print(f"YTMigrate, version {version}\n")
-    if check_config() or setup_auth():
-        ytm = do_auth()
-        if ytm:
-            menu_main(ytm)
+    ytm = do_auth()
+    if ytm:
+        menu_main(ytm)
 
 
 if __name__ == "__main__":

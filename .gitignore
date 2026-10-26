@@ -1,2 +1,5 @@
 config.json
+*_browser.json
 *_backup_*.json
+.venv/
+__pycache__/
