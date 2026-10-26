@@ -1,5 +1,6 @@
 import functools
 import os
+import sys
 import json
 from typing import Tuple
 from datetime import datetime
@@ -490,6 +491,9 @@ def do_auth() -> Tuple[YTMusic, YTMusic] | None:
 
 def main():
     print(f"YTMigrate, version {version}\n")
+    if not sys.stdin.isatty():
+        print("This tool is interactive, run it from a terminal window.")
+        return
     ytm = do_auth()
     if ytm:
         menu_main(ytm)
